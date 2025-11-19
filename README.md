@@ -10,16 +10,20 @@ A tool to make a pak with uncompressed textures for MHWilds.
 2. If it is a zip file, extract it.
 3. Run exe file, follow the instructions.
 
-### Linux
+### Linux & MacOS
 
+1. Install Rust: https://rustup.rs/
 
-```sh 
+```sh
+# 2. Clone the repository
 git clone https://github.com/eigeen/mhws-tex-decompressor
+
+# 3. Build and run the program
 cd mhws-tex-decompressor
-cargo run . --release
+cargo run --release
 ```
 
-#### Nix
+Or using Nix if you prefer:
 
 ``` sh
 nix run github:eigeen/mhws-tex-decompressor
@@ -27,4 +31,4 @@ nix run github:eigeen/mhws-tex-decompressor
 
 ## Credits
 
-[@AsteriskAmpersand](https://github.com/AsteriskAmpersand)
+[@AsteriskAmpersand](https://github.com/AsteriskAmpersand) for the original texture conversion code and the idea of using uncompressed textures.
