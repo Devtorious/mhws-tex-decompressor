@@ -1,5 +1,6 @@
 use std::{
-    io::{self, Write},
+    collections::HashSet,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -18,17 +19,13 @@ use iocraft::prelude::*;
 use parking_lot::Mutex;
 use re_tex::tex::Tex;
 use ree_pak_core::{
-    filename::FileNameTable,
-    pak::KnownAttr,
+    ExtractEvent, PakFile, pak::KnownAttr, read::entry::determine_extension_from_bytes,
     write::FileOptions,
-    ExtractEvent,
-    PakFile,
 };
 
 use crate::{chunk::ChunkName, component::UpdateCheck, metadata::PakMetadata, util::human_bytes};
 
-const FILE_NAME_LIST: &[u8] = include_bytes!("../assets/MHWs_STM_Release.list.zst");
-const AUTO_CHUNK_SELECTION_SIZE_THRESHOLD: usize = 50 * 1024 * 1024; // 50MB
+const AUTO_CHUNK_SELECTION_SIZE_THRESHOLD: usize = 1024 * 1024; // 1MB
 const FALSE_TRUE_SELECTION: [&str; 2] = ["False", "True"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,10 +60,7 @@ impl std::fmt::Display for ChunkSelection {
     }
 }
 
-#[derive(Default)]
-pub struct App {
-    filename_table: Option<Arc<FileNameTable>>,
-}
+pub struct App;
 
 impl App {
     pub async fn run(&mut self) -> color_eyre::Result<()> {
@@ -100,15 +94,6 @@ impl App {
         .render_loop()
         .await?;
 
-        element! {
-            Text(content: "Loading embedded file path list...")
-        }
-        .print();
-
-        // println!("Loading embedded file path list...");
-        let filename_table = Arc::new(FileNameTable::from_bytes(FILE_NAME_LIST)?);
-        self.filename_table = Some(filename_table);
-
         // Mode selection
         let mode = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Select mode")
@@ -122,10 +107,6 @@ impl App {
             Mode::Manual => self.manual_mode(),
             Mode::Restore => self.restore_mode(),
         }
-    }
-
-    fn filename_table_arc(&self) -> Arc<FileNameTable> {
-        Arc::clone(self.filename_table.as_ref().unwrap())
     }
 
     /// Scan for all pak files in the game directory, including DLC directory
@@ -213,7 +194,6 @@ impl App {
 
     fn process_chunk(
         &self,
-        filename_table: Arc<FileNameTable>,
         input_path: &Path,
         output_path: &Path,
         use_full_package_mode: bool,
@@ -224,15 +204,38 @@ impl App {
         let file = fs::File::open(input_path)?;
         let pak = PakFile::from_file(file.into())?;
 
-        let entry_count = if use_full_package_mode {
-            pak.metadata().entries().len()
+        let total_entry_count = pak.metadata().entries().len();
+
+        let tex_hashes = if use_full_package_mode {
+            None
         } else {
-            println!("Filtering entries...");
-            pak.metadata()
-                .entries()
-                .iter()
-                .filter(|entry| is_tex_file(entry.hash(), filename_table.as_ref()))
-                .count()
+            println!("Detecting TEX entries by file magic...");
+            let scan_bar = ProgressBar::new(total_entry_count as u64);
+            scan_bar.set_style(
+                ProgressStyle::default_bar().template("Detecting TEX: {pos}/{len} {wide_bar}")?,
+            );
+            scan_bar.enable_steady_tick(Duration::from_millis(200));
+
+            let mut hashes = HashSet::new();
+            for entry in pak.metadata().entries() {
+                let mut entry_reader = pak.open_entry(entry)?;
+                let mut magic = [0u8; 8];
+                if entry_reader.read_exact(&mut magic).is_ok()
+                    && determine_extension_from_bytes(&magic) == Some("tex")
+                {
+                    hashes.insert(entry.hash());
+                }
+                scan_bar.inc(1);
+            }
+            scan_bar.finish_and_clear();
+            println!("Detected {} TEX entries", hashes.len());
+            Some(Arc::new(hashes))
+        };
+
+        let entry_count = if use_full_package_mode {
+            total_entry_count
+        } else {
+            tex_hashes.as_ref().unwrap().len()
         };
 
         // new pak archive
@@ -274,15 +277,13 @@ impl App {
             }
         });
 
-        if !use_full_package_mode {
-            extractor = extractor
-                .file_name_table_arc(Arc::clone(&filename_table))
-                .filter(|_entry, path| path.is_some_and(is_tex_path));
+        let pak_writer_mtx1 = Arc::clone(&pak_writer_mtx);
+        let bytes_written1 = Arc::clone(&bytes_written);
+        let use_full_package_mode1 = use_full_package_mode;
+        if let Some(tex_hashes) = tex_hashes {
+            extractor = extractor.filter(move |entry, _path| tex_hashes.contains(&entry.hash()));
         }
 
-        let pak_writer_mtx1 = Arc::clone(&pak_writer_mtx);
-        let filename_table1 = Arc::clone(&filename_table);
-        let bytes_written1 = Arc::clone(&bytes_written);
         let err = extractor.run_with_entry_reader(move |entry, _rel_path, entry_reader| {
             let mut file_options = FileOptions::default();
             if use_feature_clone {
@@ -290,7 +291,37 @@ impl App {
                 file_options = file_options.with_all_attr(unknown_attr);
             }
 
-            if is_tex_file(entry.hash(), filename_table1.as_ref()) {
+            if use_full_package_mode1 {
+                let prefix = read_prefix(entry_reader, 8)?;
+                let is_tex = determine_extension_from_bytes(&prefix) == Some("tex");
+                if is_tex {
+                    let mut chained = std::io::Cursor::new(prefix).chain(entry_reader);
+                    let mut tex = Tex::from_reader(&mut chained)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    tex.batch_decompress()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+                    let tex_bytes = tex
+                        .as_bytes()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+                    let mut pak_writer = pak_writer_mtx1.lock();
+                    pak_writer
+                        .start_file(entry.hash(), file_options)
+                        .map_err(std::io::Error::other)?;
+                    pak_writer.write_all(&tex_bytes)?;
+                    bytes_written1.fetch_add(tex_bytes.len(), Ordering::SeqCst);
+                } else {
+                    let mut pak_writer = pak_writer_mtx1.lock();
+                    pak_writer
+                        .start_file(entry.hash(), file_options)
+                        .map_err(std::io::Error::other)?;
+                    pak_writer.write_all(&prefix)?;
+                    let copied = std::io::copy(entry_reader, &mut *pak_writer)? as usize;
+                    bytes_written1.fetch_add(prefix.len() + copied, Ordering::SeqCst);
+                }
+            } else {
+                // Patch mode: only TEX entries are selected and included in output.
                 let mut tex = Tex::from_reader(entry_reader)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 tex.batch_decompress()
@@ -303,16 +334,9 @@ impl App {
                 let mut pak_writer = pak_writer_mtx1.lock();
                 pak_writer
                     .start_file(entry.hash(), file_options)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    .map_err(std::io::Error::other)?;
                 pak_writer.write_all(&tex_bytes)?;
                 bytes_written1.fetch_add(tex_bytes.len(), Ordering::SeqCst);
-            } else {
-                let mut pak_writer = pak_writer_mtx1.lock();
-                pak_writer
-                    .start_file(entry.hash(), file_options)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                let copied = std::io::copy(entry_reader, &mut *pak_writer)? as usize;
-                bytes_written1.fetch_add(copied, Ordering::SeqCst);
             }
 
             Ok(())
@@ -450,13 +474,7 @@ I'm sure I've checked the list, press Enter to continue"#,
             };
 
             println!("Output patch file: {}", output_path.display());
-            self.process_chunk(
-                self.filename_table_arc(),
-                chunk_path,
-                &output_path,
-                use_replace_mode,
-                true,
-            )?;
+            self.process_chunk(chunk_path, &output_path, use_replace_mode, true)?;
 
             // In replace mode, backup the original file
             // and rename the temporary file to the original file name
@@ -510,7 +528,6 @@ I'm sure I've checked the list, press Enter to continue"#,
         let use_feature_clone = use_feature_clone == 1;
 
         self.process_chunk(
-            self.filename_table_arc(),
             input_path,
             &input_path.with_extension("uncompressed.pak"),
             use_full_package_mode,
@@ -728,21 +745,21 @@ I'm sure I've checked the list, press Enter to continue"#,
     }
 }
 
-fn is_tex_file(hash: u64, file_name_table: &FileNameTable) -> bool {
-    let Some(file_name) = file_name_table.get_file_name(hash) else {
-        return false;
-    };
-    is_tex_path(&file_name.to_string().unwrap())
-}
-
-fn is_tex_path(path: &str) -> bool {
-    if path.ends_with(".tex") {
-        return true;
+fn read_prefix<R>(reader: &mut R, max_len: usize) -> io::Result<Vec<u8>>
+where
+    R: Read,
+{
+    let mut buf = vec![0u8; max_len];
+    let mut read_len = 0usize;
+    while read_len < max_len {
+        let n = reader.read(&mut buf[read_len..])?;
+        if n == 0 {
+            break;
+        }
+        read_len += n;
     }
-    let Some((_base, suffix)) = path.rsplit_once(".tex.") else {
-        return false;
-    };
-    !suffix.is_empty() && suffix.as_bytes().iter().all(|c| c.is_ascii_digit())
+    buf.truncate(read_len);
+    Ok(buf)
 }
 
 fn wait_for_enter(msg: &str) {

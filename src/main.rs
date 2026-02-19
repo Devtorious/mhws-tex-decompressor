@@ -12,7 +12,7 @@ use dialoguer::{Input, theme::ColorfulTheme};
 async fn main() -> color_eyre::Result<()> {
     std::panic::set_hook(Box::new(panic_hook));
 
-    let mut app = app::App::default();
+    let mut app = app::App;
     if let Err(e) = app.run().await {
         eprintln!("{}: {:#}", "Error".red().bold(), e);
         wait_for_exit();
