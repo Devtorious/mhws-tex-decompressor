@@ -1,6 +1,6 @@
 [package]
 name = "mhws-tex-decompressor"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 
 [dependencies]
@@ -9,27 +9,26 @@ edition = "2024"
 # ree-pak-core = { path = "../../ree-pak-rs/ree-pak-core" }
 
 re-tex = { git = "https://github.com/eigeen/re-tex.git", rev = "64f85bc" }
-ree-pak-core = { git = "https://github.com/eigeen/ree-pak-rs.git", rev = "f1052e9" }
+ree-pak-core = { git = "https://github.com/eigeen/ree-pak-rs.git", rev = "6dad4ae", package = "ree-pak-core" }
 
 # UI
 dialoguer = "0.12"
 indicatif = "0.18"
-colored = "3.0"
+colored = "3.1"
 
 color-eyre = "0.6"
-rayon = "1.11"
 parking_lot = "0.12"
-fs-err = "3.1"
+fs-err = "3.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.47", features = [
+tokio = { version = "1.49", features = [
     "parking_lot",
     "rt-multi-thread",
     "macros",
 ] }
 iocraft = "0.7"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 semver = "1.0"
 self-replace = "1.5"
-tempfile = "3.23"
-zip = { version = "5.1", default-features = false, features = ["deflate"] }
+tempfile = "3.25"
+zip = { version = "8.1", default-features = false, features = ["deflate"] }

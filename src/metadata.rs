@@ -3,8 +3,8 @@
 use std::io::{self, Read, Write};
 
 use ree_pak_core::{
-    pak::PakArchive,
-    read::archive::PakArchiveReader,
+    pak::PakMetadata as PakFileMetadata,
+    read::archive::PakMetadataReader,
     utf16_hash::Utf16HashExt,
     write::{FileOptions, PakWriter},
 };
@@ -32,7 +32,7 @@ impl PakMetadata {
 
     pub fn from_pak_archive<R>(
         reader: R,
-        pak_archive: &PakArchive,
+        pak_archive: &PakFileMetadata,
     ) -> color_eyre::Result<Option<Self>>
     where
         R: io::Read + io::Seek,
@@ -44,7 +44,7 @@ impl PakMetadata {
 
         if let Some(entry) = entry {
             // read file
-            let mut archive_reader = PakArchiveReader::new(reader, pak_archive);
+            let mut archive_reader = PakMetadataReader::new(reader, pak_archive);
             let mut entry_reader = archive_reader.owned_entry_reader(entry.clone())?;
             let mut buf = Vec::new();
             entry_reader.read_to_end(&mut buf)?;
@@ -54,6 +54,16 @@ impl PakMetadata {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn from_pak_metadata<R>(
+        reader: R,
+        pak_metadata: &PakFileMetadata,
+    ) -> color_eyre::Result<Option<Self>>
+    where
+        R: io::Read + io::Seek,
+    {
+        Self::from_pak_archive(reader, pak_metadata)
     }
 
     pub fn write_to_pak<W>(&self, pak_writer: &mut PakWriter<W>) -> color_eyre::Result<()>

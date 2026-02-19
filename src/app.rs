@@ -16,11 +16,13 @@ use fs::OpenOptions;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use iocraft::prelude::*;
 use parking_lot::Mutex;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use re_tex::tex::Tex;
 use ree_pak_core::{
-    filename::FileNameTable, pak::PakEntry, read::archive::PakArchiveReader,
-    utf16_hash::Utf16HashExt, write::FileOptions,
+    filename::FileNameTable,
+    pak::KnownAttr,
+    write::FileOptions,
+    ExtractEvent,
+    PakFile,
 };
 
 use crate::{chunk::ChunkName, component::UpdateCheck, metadata::PakMetadata, util::human_bytes};
@@ -63,7 +65,7 @@ impl std::fmt::Display for ChunkSelection {
 
 #[derive(Default)]
 pub struct App {
-    filename_table: Option<FileNameTable>,
+    filename_table: Option<Arc<FileNameTable>>,
 }
 
 impl App {
@@ -104,7 +106,7 @@ impl App {
         .print();
 
         // println!("Loading embedded file path list...");
-        let filename_table = FileNameTable::from_bytes(FILE_NAME_LIST)?;
+        let filename_table = Arc::new(FileNameTable::from_bytes(FILE_NAME_LIST)?);
         self.filename_table = Some(filename_table);
 
         // Mode selection
@@ -122,8 +124,8 @@ impl App {
         }
     }
 
-    fn filename_table(&self) -> &FileNameTable {
-        self.filename_table.as_ref().unwrap()
+    fn filename_table_arc(&self) -> Arc<FileNameTable> {
+        Arc::clone(self.filename_table.as_ref().unwrap())
     }
 
     /// Scan for all pak files in the game directory, including DLC directory
@@ -211,7 +213,7 @@ impl App {
 
     fn process_chunk(
         &self,
-        filename_table: &FileNameTable,
+        filename_table: Arc<FileNameTable>,
         input_path: &Path,
         output_path: &Path,
         use_full_package_mode: bool,
@@ -220,22 +222,17 @@ impl App {
         println!("Processing chunk: {}", input_path.display());
 
         let file = fs::File::open(input_path)?;
-        let mut reader = io::BufReader::new(file);
+        let pak = PakFile::from_file(file.into())?;
 
-        let pak_archive = ree_pak_core::read::read_archive(&mut reader)?;
-        let archive_reader = PakArchiveReader::new(reader, &pak_archive);
-        let archive_reader_mtx = Mutex::new(archive_reader);
-
-        // filtered entries
-        let entries = if use_full_package_mode {
-            pak_archive.entries().iter().collect::<Vec<_>>()
+        let entry_count = if use_full_package_mode {
+            pak.metadata().entries().len()
         } else {
             println!("Filtering entries...");
-            pak_archive
+            pak.metadata()
                 .entries()
                 .iter()
-                .filter(|entry| is_tex_file(entry.hash(), filename_table))
-                .collect::<Vec<_>>()
+                .filter(|entry| is_tex_file(entry.hash(), filename_table.as_ref()))
+                .count()
         };
 
         // new pak archive
@@ -246,7 +243,7 @@ impl App {
             .open(output_path)?;
         // +1 for metadata
         let mut pak_writer =
-            ree_pak_core::write::PakWriter::new(out_file, (entries.len() as u64) + 1);
+            ree_pak_core::write::PakWriter::new(out_file, (entry_count as u64) + 1);
 
         // write metadata
         let metadata = PakMetadata::new(use_full_package_mode);
@@ -254,66 +251,73 @@ impl App {
 
         let pak_writer_mtx = Arc::new(Mutex::new(pak_writer));
 
-        let bar = ProgressBar::new(entries.len() as u64);
+        let bar = ProgressBar::new(entry_count as u64);
         bar.set_style(
             ProgressStyle::default_bar()
                 .template("Bytes written: {msg}\n{pos}/{len} {wide_bar}")?,
         );
         bar.enable_steady_tick(Duration::from_millis(200));
 
-        let pak_writer_mtx1 = Arc::clone(&pak_writer_mtx);
-        let bar1 = bar.clone();
-        let bytes_written = AtomicUsize::new(0);
-        let err = entries
-            .par_iter()
-            .try_for_each(move |&entry| -> color_eyre::Result<()> {
-                let pak_writer_mtx = &pak_writer_mtx1;
-                let bar = &bar1;
-                // read raw tex file
-                // parse tex file
-                let mut entry_reader = {
-                    let mut archive_reader = archive_reader_mtx.lock();
-                    archive_reader.owned_entry_reader(entry.clone())?
-                };
+        let bytes_written = Arc::new(AtomicUsize::new(0));
+        let bar_evt = bar.clone();
+        let bytes_written_evt = Arc::clone(&bytes_written);
 
-                if !is_tex_file(entry.hash(), filename_table) {
-                    // plain file, just copy
-                    let mut buf = vec![];
-                    std::io::copy(&mut entry_reader, &mut buf)?;
-                    let mut pak_writer = pak_writer_mtx.lock();
-                    let write_bytes = write_to_pak(
-                        &mut pak_writer,
-                        entry,
-                        entry.hash(),
-                        &buf,
-                        use_feature_clone,
-                    )?;
-                    bytes_written.fetch_add(write_bytes, Ordering::SeqCst);
-                } else {
-                    let mut tex = Tex::from_reader(&mut entry_reader)?;
-                    // decompress mipmaps
-                    tex.batch_decompress()?;
-
-                    let tex_bytes = tex.as_bytes()?;
-                    let mut pak_writer = pak_writer_mtx.lock();
-                    let write_bytes = write_to_pak(
-                        &mut pak_writer,
-                        entry,
-                        entry.hash(),
-                        &tex_bytes,
-                        use_feature_clone,
-                    )?;
-                    bytes_written.fetch_add(write_bytes, Ordering::SeqCst);
-                }
-
-                bar.inc(1);
-                if bar.position().is_multiple_of(100) {
-                    bar.set_message(
-                        HumanBytes(bytes_written.load(Ordering::SeqCst) as u64).to_string(),
+        // Use extractor_callback to drive entry reads (handles chunk-table offsets internally).
+        let mut extractor = pak.extractor_callback().on_event(move |event| {
+            if let ExtractEvent::FileDone { .. } = event {
+                bar_evt.inc(1);
+                if bar_evt.position().is_multiple_of(100) {
+                    bar_evt.set_message(
+                        HumanBytes(bytes_written_evt.load(Ordering::SeqCst) as u64).to_string(),
                     );
                 }
-                Ok(())
-            });
+            }
+        });
+
+        if !use_full_package_mode {
+            extractor = extractor
+                .file_name_table_arc(Arc::clone(&filename_table))
+                .filter(|_entry, path| path.is_some_and(is_tex_path));
+        }
+
+        let pak_writer_mtx1 = Arc::clone(&pak_writer_mtx);
+        let filename_table1 = Arc::clone(&filename_table);
+        let bytes_written1 = Arc::clone(&bytes_written);
+        let err = extractor.run_with_entry_reader(move |entry, _rel_path, entry_reader| {
+            let mut file_options = FileOptions::default();
+            if use_feature_clone {
+                let unknown_attr = entry.all_attr() & !KnownAttr::KNOWN_MASK;
+                file_options = file_options.with_all_attr(unknown_attr);
+            }
+
+            if is_tex_file(entry.hash(), filename_table1.as_ref()) {
+                let mut tex = Tex::from_reader(entry_reader)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                tex.batch_decompress()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+                let tex_bytes = tex
+                    .as_bytes()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+                let mut pak_writer = pak_writer_mtx1.lock();
+                pak_writer
+                    .start_file(entry.hash(), file_options)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                pak_writer.write_all(&tex_bytes)?;
+                bytes_written1.fetch_add(tex_bytes.len(), Ordering::SeqCst);
+            } else {
+                let mut pak_writer = pak_writer_mtx1.lock();
+                pak_writer
+                    .start_file(entry.hash(), file_options)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                let copied = std::io::copy(entry_reader, &mut *pak_writer)? as usize;
+                bytes_written1.fetch_add(copied, Ordering::SeqCst);
+            }
+
+            Ok(())
+        });
+
         if let Err(e) = err {
             eprintln!("Error occurred when processing tex: {e}");
             eprintln!(
@@ -447,7 +451,7 @@ I'm sure I've checked the list, press Enter to continue"#,
 
             println!("Output patch file: {}", output_path.display());
             self.process_chunk(
-                self.filename_table(),
+                self.filename_table_arc(),
                 chunk_path,
                 &output_path,
                 use_replace_mode,
@@ -506,7 +510,7 @@ I'm sure I've checked the list, press Enter to continue"#,
         let use_feature_clone = use_feature_clone == 1;
 
         self.process_chunk(
-            self.filename_table(),
+            self.filename_table_arc(),
             input_path,
             &input_path.with_extension("uncompressed.pak"),
             use_full_package_mode,
@@ -697,12 +701,12 @@ I'm sure I've checked the list, press Enter to continue"#,
         };
 
         let mut reader = io::BufReader::new(file);
-        let pak_archive = match ree_pak_core::read::read_archive(&mut reader) {
-            Ok(archive) => archive,
+        let pak_metadata = match ree_pak_core::read::read_metadata(&mut reader) {
+            Ok(metadata) => metadata,
             Err(_) => return Ok(None),
         };
 
-        PakMetadata::from_pak_archive(reader, &pak_archive)
+        PakMetadata::from_pak_metadata(reader, &pak_metadata)
     }
 
     /// create an empty patch file
@@ -728,26 +732,17 @@ fn is_tex_file(hash: u64, file_name_table: &FileNameTable) -> bool {
     let Some(file_name) = file_name_table.get_file_name(hash) else {
         return false;
     };
-    file_name.to_string().unwrap().ends_with(".tex.241106027")
+    is_tex_path(&file_name.to_string().unwrap())
 }
 
-fn write_to_pak<W>(
-    writer: &mut ree_pak_core::write::PakWriter<W>,
-    entry: &PakEntry,
-    file_name: impl Utf16HashExt,
-    data: &[u8],
-    use_feature_clone: bool,
-) -> color_eyre::Result<usize>
-where
-    W: io::Write + io::Seek,
-{
-    let mut file_options = FileOptions::default();
-    if use_feature_clone {
-        file_options = file_options.with_unk_attr(*entry.unk_attr())
+fn is_tex_path(path: &str) -> bool {
+    if path.ends_with(".tex") {
+        return true;
     }
-    writer.start_file(file_name, file_options)?;
-    writer.write_all(data)?;
-    Ok(data.len())
+    let Some((_base, suffix)) = path.rsplit_once(".tex.") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.as_bytes().iter().all(|c| c.is_ascii_digit())
 }
 
 fn wait_for_enter(msg: &str) {
