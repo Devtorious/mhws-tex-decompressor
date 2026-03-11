@@ -14,11 +14,13 @@ A tool to make a pak with uncompressed textures for MHWilds.
 
 1. Install Rust: https://rustup.rs/
 
-```sh
-# 2. Clone the repository
-git clone https://github.com/eigeen/mhws-tex-decompressor
 
-# 3. Build and run the program
+2. Clone the repository
+```sh
+git clone https://github.com/eigeen/mhws-tex-decompressor
+```
+3. Build and run the program
+```sh
 cd mhws-tex-decompressor
 cargo run --release
 ```
@@ -27,6 +29,12 @@ Or using Nix if you prefer:
 
 ``` sh
 nix run github:eigeen/mhws-tex-decompressor
+```
+
+Fedora:
+
+``` sh
+sudo dnf in git rust cargo gcc-c++ -y 
 ```
 
 ## Credits
